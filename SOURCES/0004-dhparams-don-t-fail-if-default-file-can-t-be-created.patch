@@ -1,0 +1,139 @@
+From 282f819bc39c9557ee34f73c6f6623182f680792 Mon Sep 17 00:00:00 2001
+From: Stephen Gallagher <sgallagh@redhat.com>
+Date: Wed, 16 Nov 2022 15:27:58 -0500
+Subject: [PATCH] dhparams: don't fail if default file can't be created
+
+Resolves: rhbz#2143206
+
+Signed-off-by: Stephen Gallagher <sgallagh@redhat.com>
+---
+ src/arguments.c |  1 -
+ src/io_utils.c  | 12 +++++++++++
+ src/sscg.c      | 55 +++++++++++++++++++++++++++++++++----------------
+ 3 files changed, 49 insertions(+), 19 deletions(-)
+
+diff --git a/src/arguments.c b/src/arguments.c
+index 7b9da14a732875b0f33a12e22a97d51a78216839..770d834aacc05d6d92cc0c855852eadb88f8c9bc 100644
+--- a/src/arguments.c
++++ b/src/arguments.c
+@@ -69,7 +69,6 @@ set_default_options (struct sscg_options *opts)
+ 
+   opts->lifetime = 398;
+ 
+-  opts->dhparams_file = talloc_strdup (opts, "dhparams.pem");
+   opts->dhparams_group = talloc_strdup (opts, "ffdhe4096");
+   opts->dhparams_generator = 2;
+ 
+diff --git a/src/io_utils.c b/src/io_utils.c
+index 1b8bc41c3849acbe4657ae14dfe55e3010957129..5d34327bdbe450add5326ac20c337c9399b471dc 100644
+--- a/src/io_utils.c
++++ b/src/io_utils.c
+@@ -544,6 +544,18 @@ sscg_io_utils_open_output_files (struct sscg_stream **streams, bool overwrite)
+     {
+       SSCG_LOG (SSCG_DEBUG, "Opening %s\n", stream->path);
+       stream->bio = BIO_new_file (stream->path, create_mode);
++      if (!stream->bio)
++        {
++          fprintf (stderr,
++                   "Could not write to %s. Check directory permissions.\n",
++                   stream->path);
++
++          /* The dhparams file is special, it will be handled later */
++          if (i != SSCG_FILE_TYPE_DHPARAMS)
++            {
++              continue;
++            }
++        }
+       CHECK_BIO (stream->bio, stream->path);
+     }
+ 
+diff --git a/src/sscg.c b/src/sscg.c
+index 1bf8019c2dda136abe56acd101dfe8ad0b3d725d..dcff4cd2b8dfd2e11c8612d36ecc94b175e9dc26 100644
+--- a/src/sscg.c
++++ b/src/sscg.c
+@@ -93,6 +93,7 @@ main (int argc, const char **argv)
+   int ret, sret;
+   struct sscg_options *options;
+   bool build_client_cert = false;
++  char *dhparams_file = NULL;
+ 
+   struct sscg_x509_cert *cacert;
+   struct sscg_evp_pkey *cakey;
+@@ -182,9 +183,19 @@ main (int argc, const char **argv)
+                                        options->crl_mode);
+   CHECK_OK (ret);
+ 
++  if (options->dhparams_file)
++    {
++      dhparams_file = talloc_strdup (main_ctx, options->dhparams_file);
++    }
++  else
++    {
++      dhparams_file = talloc_strdup (main_ctx, "./dhparams.pem");
++    }
++  CHECK_MEM (dhparams_file);
++
+   ret = sscg_io_utils_add_output_file (options->streams,
+                                        SSCG_FILE_TYPE_DHPARAMS,
+-                                       options->dhparams_file,
++                                       dhparams_file,
+                                        options->dhparams_mode);
+   CHECK_OK (ret);
+ 
+@@ -281,28 +292,36 @@ main (int argc, const char **argv)
+ 
+ 
+   /* Create DH parameters file */
+-  bp = GET_BIO (SSCG_FILE_TYPE_DHPARAMS);
+-  if (options->dhparams_prime_len > 0)
++  if ((bp = GET_BIO (SSCG_FILE_TYPE_DHPARAMS)))
+     {
+-      ret = create_dhparams (options->verbosity,
+-                             options->dhparams_prime_len,
+-                             options->dhparams_generator,
+-                             &dhparams);
+-      CHECK_OK (ret);
++      if (options->dhparams_prime_len > 0)
++        {
++          ret = create_dhparams (options->verbosity,
++                                 options->dhparams_prime_len,
++                                 options->dhparams_generator,
++                                 &dhparams);
++          CHECK_OK (ret);
++        }
++      else
++        {
++          ret = get_params_by_named_group (options->dhparams_group, &dhparams);
++          CHECK_OK (ret);
++        }
++
++      /* Export the DH parameters to the file */
++      sret = PEM_write_bio_Parameters (bp, dhparams);
++      CHECK_SSL (sret, PEM_write_bio_Parameters ());
++      ANNOUNCE_WRITE (SSCG_FILE_TYPE_DHPARAMS);
++      EVP_PKEY_free (dhparams);
+     }
+-  else
++  else if (options->dhparams_file)
+     {
+-      ret = get_params_by_named_group (options->dhparams_group, &dhparams);
+-      CHECK_OK (ret);
++      /* A filename was explicitly passed, but it couldn't be created */
++      ret = EPERM;
++      fprintf (stderr, "Could not write to %s: ", options->dhparams_file);
++      goto done;
+     }
+ 
+-  /* Export the DH parameters to the file */
+-  sret = PEM_write_bio_Parameters (bp, dhparams);
+-  CHECK_SSL (sret, PEM_write_bio_Parameters ());
+-  ANNOUNCE_WRITE (SSCG_FILE_TYPE_DHPARAMS);
+-  EVP_PKEY_free (dhparams);
+-
+-
+   /* Set the final file permissions */
+   sscg_io_utils_finalize_output_files (options->streams);
+ 
+-- 
+2.38.1
+

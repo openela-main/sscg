@@ -1,0 +1,32 @@
+From e65a507c487a37dd5a8c90b7dbd1ff3274146239 Mon Sep 17 00:00:00 2001
+From: Simon Chopin <simon.chopin@canonical.com>
+Date: Mon, 13 Dec 2021 15:20:55 +0100
+Subject: [PATCH 5/5] dhparams: Fix the FIPS_mode() call for OpenSSL 3.0
+
+This function has been removed from OpenSSL 3.0, replaced by
+EVP_default_properties_is_fips_enabled().
+
+Closes #50
+---
+ src/dhparams.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/dhparams.c b/src/dhparams.c
+index 5c50128970d48790df910b9f9531e61e1d4c5758..61fd57aeedca47fba49f75d356cd5f42b9586696 100644
+--- a/src/dhparams.c
++++ b/src/dhparams.c
+@@ -231,7 +231,11 @@ is_valid_named_group (const char *group_name)
+     }
+ 
+   /* Check non-FIPS groups */
++#if OPENSSL_VERSION_NUMBER < 0x30000000L
+   if (!FIPS_mode ())
++#else
++  if (!EVP_default_properties_is_fips_enabled(NULL))
++#endif
+     {
+       i = 0;
+       while (dh_nonfips_groups[i])
+-- 
+2.31.1
+
