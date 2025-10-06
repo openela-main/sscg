@@ -1,0 +1,205 @@
+From 750dee2eded3b1c16e0434fa387d35a869545d9e Mon Sep 17 00:00:00 2001
+From: Stephen Gallagher <sgallagh@redhat.com>
+Date: Wed, 15 Feb 2023 15:49:38 -0500
+Subject: [PATCH 1/2] Extend maximum DNS name to 255
+
+The hostname part is still restricted to 63 characters
+
+See RFC 1035, section 2.3.4
+
+Signed-off-by: Stephen Gallagher <sgallagh@redhat.com>
+---
+ include/sscg.h  |  3 +++
+ src/arguments.c | 35 +++++++++++++++++++++++++++--------
+ src/authority.c | 26 +++++++++++++++++++++++---
+ src/cert.c      |  5 +++++
+ src/x509.c      |  6 +++---
+ 5 files changed, 61 insertions(+), 14 deletions(-)
+
+diff --git a/include/sscg.h b/include/sscg.h
+index 0f35631018dc2745e986cd1e7e094e3e37be8e54..f0c6d93b871e4bd3f2c805be8dfa7485ec34746a 100644
+--- a/include/sscg.h
++++ b/include/sscg.h
+@@ -313,6 +313,9 @@ enum sscg_cert_type
+ #define SSCG_MIN_KEY_PASS_LEN 4
+ #define SSCG_MAX_KEY_PASS_LEN 1023
+ 
++/* RFC 1035, section 2.3.4 (Size Limits) */
++#define MAX_HOST_LEN 63
++#define MAX_FQDN_LEN 255
+ 
+ int
+ sscg_handle_arguments (TALLOC_CTX *mem_ctx,
+diff --git a/src/arguments.c b/src/arguments.c
+index 0b7a060d31bed97130c7cb9b7feacf0876e25c0d..2f412bee1bee9620f28b6e84aed4aef17aee3a6a 100644
+--- a/src/arguments.c
++++ b/src/arguments.c
+@@ -786,10 +786,19 @@ sscg_handle_arguments (TALLOC_CTX *mem_ctx,
+     }
+   CHECK_MEM (options->hostname);
+ 
+-  if (strnlen (options->hostname, MAXHOSTNAMELEN + 1) > MAXHOSTNAMELEN)
++  if (strnlen (options->hostname, MAX_FQDN_LEN + 1) > MAX_FQDN_LEN)
+     {
+-      fprintf (
+-        stderr, "Hostnames may not exceed %d characters\n", MAXHOSTNAMELEN);
++      fprintf (stderr, "FQDNs may not exceed %d characters\n", MAX_FQDN_LEN);
++      ret = EINVAL;
++      goto done;
++    }
++
++  if ((strchr (options->hostname, '.') - options->hostname) > MAX_HOST_LEN + 4)
++    {
++      fprintf (stderr,
++               "Hostnames may not exceed %d characters in Subject "
++               "Alternative Names\n",
++               MAX_HOST_LEN);
+       ret = EINVAL;
+       goto done;
+     }
+@@ -798,25 +807,35 @@ sscg_handle_arguments (TALLOC_CTX *mem_ctx,
+        options struct. It's not the most efficient approach, but
+        it's only done one time, so there is no sense in optimizing
+        it. */
++  size_t i = 0;
+   if (alternative_names)
+     {
+-      size_t i = 0;
+       while (alternative_names[i] != NULL)
+         {
+           options->subject_alt_names = talloc_realloc (
+-            options, options->subject_alt_names, char *, i + 2);
++            options, options->subject_alt_names, char *, i + 1);
+           CHECK_MEM (options->subject_alt_names);
+ 
+           options->subject_alt_names[i] =
+             talloc_strdup (options->subject_alt_names, alternative_names[i]);
+           CHECK_MEM (options->subject_alt_names[i]);
+-
+-          /* Add a NULL terminator to the end */
+-          options->subject_alt_names[i + 1] = NULL;
+           i++;
+         }
+     }
+ 
++  /*
++    The hostname must always be listed in SubjectAlternativeNames as well.
++    Note that the realloc also adds an extra entry for the NULL terminator
++  */
++  options->subject_alt_names =
++    talloc_realloc (options, options->subject_alt_names, char *, i + 2);
++  CHECK_MEM (options->subject_alt_names);
++  options->subject_alt_names[i] =
++    talloc_strdup (options->subject_alt_names, options->hostname);
++  CHECK_MEM (options->subject_alt_names[i]);
++  /* Add a NULL terminator to the end */
++  options->subject_alt_names[i + 1] = NULL;
++
+   if (options->key_strength < options->minimum_key_strength)
+     {
+       fprintf (stderr,
+diff --git a/src/authority.c b/src/authority.c
+index 4efaa9e730964b9762b59d0e6698c1623901ccfe..f509fd4316c3b7b230f99de6464491c319fc5d45 100644
+--- a/src/authority.c
++++ b/src/authority.c
+@@ -56,6 +56,7 @@ create_private_CA (TALLOC_CTX *mem_ctx,
+   char *name_constraint;
+   char *san;
+   char *tmp;
++  char *dot;
+ 
+   tmp_ctx = talloc_new (NULL);
+   CHECK_MEM (tmp_ctx);
+@@ -89,6 +90,26 @@ create_private_CA (TALLOC_CTX *mem_ctx,
+ 
+   ca_certinfo->cn = talloc_strdup (ca_certinfo, options->hostname);
+   CHECK_MEM (ca_certinfo->cn);
++  /* Truncate the CN at the first dot */
++  if ((dot = strchr (ca_certinfo->cn, '.')))
++    *dot = '\0';
++
++  if (options->subject_alt_names)
++    {
++      for (i = 0; options->subject_alt_names[i]; i++)
++        {
++          ca_certinfo->subject_alt_names = talloc_realloc (
++            ca_certinfo, ca_certinfo->subject_alt_names, char *, i + 2);
++          CHECK_MEM (ca_certinfo->subject_alt_names);
++
++          ca_certinfo->subject_alt_names[i] = talloc_strdup (
++            ca_certinfo->subject_alt_names, options->subject_alt_names[i]);
++          CHECK_MEM (ca_certinfo->subject_alt_names[i]);
++
++          /* Add a NULL terminator to the end */
++          ca_certinfo->subject_alt_names[i + 1] = NULL;
++        }
++    }
+ 
+   /* Make this a CA certificate */
+ 
+@@ -106,10 +127,9 @@ create_private_CA (TALLOC_CTX *mem_ctx,
+   CHECK_MEM (ex);
+   sk_X509_EXTENSION_push (ca_certinfo->extensions, ex);
+ 
+-  /* Restrict signing to the hostname and subjectAltNames of the
+-       service certificate */
++  /* Restrict signing to the CN and subjectAltNames of the service certificate */
+   name_constraint =
+-    talloc_asprintf (tmp_ctx, "permitted;DNS:%s", options->hostname);
++    talloc_asprintf (tmp_ctx, "permitted;DNS:%s", ca_certinfo->cn);
+   CHECK_MEM (name_constraint);
+ 
+   if (options->subject_alt_names)
+diff --git a/src/cert.c b/src/cert.c
+index 99d9109f5981ef408aeb7d05a8327e1a38d5700a..e36de71e7ca9b34f87734542d5646b466cd61d4c 100644
+--- a/src/cert.c
++++ b/src/cert.c
+@@ -31,6 +31,7 @@
+ */
+ 
+ 
++#include <string.h>
+ #include "include/sscg.h"
+ #include "include/cert.h"
+ #include "include/x509.h"
+@@ -52,6 +53,7 @@ create_cert (TALLOC_CTX *mem_ctx,
+   struct sscg_x509_req *csr;
+   struct sscg_evp_pkey *pkey;
+   struct sscg_x509_cert *cert;
++  char *dot;
+   X509_EXTENSION *ex = NULL;
+   EXTENDED_KEY_USAGE *extended;
+   TALLOC_CTX *tmp_ctx = NULL;
+@@ -87,6 +89,9 @@ create_cert (TALLOC_CTX *mem_ctx,
+ 
+   certinfo->cn = talloc_strdup (certinfo, options->hostname);
+   CHECK_MEM (certinfo->cn);
++  /* Truncate the CN at the first dot */
++  if ((dot = strchr (certinfo->cn, '.')))
++    *dot = '\0';
+ 
+   if (options->subject_alt_names)
+     {
+diff --git a/src/x509.c b/src/x509.c
+index 4f3f11cd3411f00cf6de3a72ba897adc97944e35..9f6f21b49c2dd70629fed67d327027374eb21b15 100644
+--- a/src/x509.c
++++ b/src/x509.c
+@@ -290,12 +290,12 @@ sscg_x509v3_csr_new (TALLOC_CTX *mem_ctx,
+             }
+           CHECK_MEM (san);
+ 
+-          if (strnlen (san, MAXHOSTNAMELEN + 5) > MAXHOSTNAMELEN + 4)
++          if (strnlen (san, MAX_FQDN_LEN + 5) > MAX_FQDN_LEN + 4)
+             {
+               fprintf (stderr,
+-                       "Hostnames may not exceed %d characters in Subject "
++                       "FQDNs may not exceed %d characters in Subject "
+                        "Alternative Names\n",
+-                       MAXHOSTNAMELEN);
++                       MAX_FQDN_LEN);
+               ret = EINVAL;
+               goto done;
+             }
+-- 
+2.41.0
+
