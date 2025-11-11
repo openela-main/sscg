@@ -1,0 +1,31 @@
+From 70b0a4742a67616a5223a0cdc2067effccf081e9 Mon Sep 17 00:00:00 2001
+From: Sebastian Andrzej Siewior <sebastian@breakpoint.cc>
+Date: Sat, 19 Oct 2024 15:43:20 +0200
+Subject: [PATCH 3/3] x509: Use proper version for CSR.
+
+RFC 2986 only defines a single version for CSRs: X509_VERSION_1 (0).
+OpenSSL starting with 3.4 rejects everything else.
+
+Use X509_VERSION_1 as version for X509_REQ_set_version.
+
+Signed-off-by: Sebastian Andrzej Siewior <sebastian@breakpoint.cc>
+---
+ src/x509.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/x509.c b/src/x509.c
+index 9f6f21b49c2dd70629fed67d327027374eb21b15..503b7b1b51ed45909104d1b5e593129ee9e8dee2 100644
+--- a/src/x509.c
++++ b/src/x509.c
+@@ -169,7 +169,7 @@ sscg_x509v3_csr_new (TALLOC_CTX *mem_ctx,
+   talloc_set_destructor ((TALLOC_CTX *)csr, _sscg_csr_destructor);
+ 
+   /* We will generate only x509v3 certificates */
+-  sslret = X509_REQ_set_version (csr->x509_req, 2);
++  sslret = X509_REQ_set_version (csr->x509_req, X509_VERSION_1);
+   CHECK_SSL (sslret, X509_REQ_set_version);
+ 
+   subject = X509_REQ_get_subject_name (csr->x509_req);
+-- 
+2.49.0
+
