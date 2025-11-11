@@ -1,7 +1,7 @@
-From 282f819bc39c9557ee34f73c6f6623182f680792 Mon Sep 17 00:00:00 2001
+From 259c4c83307273551fd267585ec8854896a168bd Mon Sep 17 00:00:00 2001
 From: Stephen Gallagher <sgallagh@redhat.com>
 Date: Wed, 16 Nov 2022 15:27:58 -0500
-Subject: [PATCH] dhparams: don't fail if default file can't be created
+Subject: [PATCH 4/6] dhparams: don't fail if default file can't be created
 
 Resolves: rhbz#2143206
 
@@ -135,5 +135,5 @@ index 1bf8019c2dda136abe56acd101dfe8ad0b3d725d..dcff4cd2b8dfd2e11c8612d36ecc94b1
    sscg_io_utils_finalize_output_files (options->streams);
  
 -- 
-2.38.1
+2.49.0
 

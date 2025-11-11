@@ -1,0 +1,1115 @@
+From aac0351de2fade86572eac4f24e22bd667177f7e Mon Sep 17 00:00:00 2001
+From: Stephen Gallagher <sgallagh@redhat.com>
+Date: Mon, 21 Jul 2025 15:13:31 -0400
+Subject: [PATCH 8/8] Fix IP address handling in CA certificate SAN constraints
+
+- Add automatic single-IP subnet mask to IP addresses in CA name constraints
+- Update help text to show simplified IP format without subnet mask
+- Add comprehensive test for basicConstraints
+
+Signed-off-by: Stephen Gallagher <sgallagh@redhat.com>
+---
+ src/arguments.c       |   2 +-
+ src/authority.c       |  84 ++++
+ test/create_ca_test.c | 960 +++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 1044 insertions(+), 2 deletions(-)
+
+diff --git a/src/arguments.c b/src/arguments.c
+index 770d834aacc05d6d92cc0c855852eadb88f8c9bc..96e3bbb1bcb2efc4e155b646104ffc8f2500079e 100644
+--- a/src/arguments.c
++++ b/src/arguments.c
+@@ -309,7 +309,7 @@ sscg_handle_arguments (TALLOC_CTX *mem_ctx,
+       _ ("Optional additional valid hostnames for the certificate. "
+          "In addition to hostnames, this option also accepts explicit values "
+          "supported by RFC 5280 such as "
+-         "IP:xxx.xxx.xxx.xxx/yyy.yyy.yyy.yyy "
++         "IP:xxx.xxx.xxx.xxx "
+          "May be specified multiple times."),
+       _ ("alt.example.com")
+     },
+diff --git a/src/authority.c b/src/authority.c
+index 044c62f5192e75a9f7d3f49616f852a97da7505a..8590e844bee3cc2888476135dc44711d7ba6fc28 100644
+--- a/src/authority.c
++++ b/src/authority.c
+@@ -109,6 +109,90 @@ create_private_CA (TALLOC_CTX *mem_ctx,
+               san = talloc_asprintf (
+                 tmp_ctx, "DNS:%s", options->subject_alt_names[i]);
+             }
++          else if (strncmp (options->subject_alt_names[i], "IP:", 3) == 0)
++            {
++              char *ip_addr = options->subject_alt_names[i] + 3;
++              char *slash = strchr (ip_addr, '/');
++              char *clean_ip = ip_addr;
++              const char *netmask_str = NULL;
++
++              if (slash)
++                {
++                  /* Extract IP and netmask parts */
++                  clean_ip =
++                    talloc_strndup (tmp_ctx, ip_addr, slash - ip_addr);
++                  char *cidr_str = slash + 1;
++                  int cidr_bits = atoi (cidr_str);
++
++                  /* Convert CIDR to appropriate netmask format */
++                  if (strchr (clean_ip, ':'))
++                    {
++                      /* IPv6 - convert CIDR to hex netmask */
++                      if (cidr_bits == 128)
++                        {
++                          netmask_str =
++                            "FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF";
++                        }
++                      else if (cidr_bits == 64)
++                        {
++                          netmask_str = "FFFF:FFFF:FFFF:FFFF:0:0:0:0";
++                        }
++                      else
++                        {
++                          /* For other values, default to /128 */
++                          netmask_str =
++                            "FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF";
++                        }
++                    }
++                  else
++                    {
++                      /* IPv4 - convert CIDR to dotted decimal */
++                      if (cidr_bits == 32)
++                        {
++                          netmask_str = "255.255.255.255";
++                        }
++                      else if (cidr_bits == 24)
++                        {
++                          netmask_str = "255.255.255.0";
++                        }
++                      else if (cidr_bits == 16)
++                        {
++                          netmask_str = "255.255.0.0";
++                        }
++                      else if (cidr_bits == 8)
++                        {
++                          netmask_str = "255.0.0.0";
++                        }
++                      else
++                        {
++                          /* For other values, default to /32 */
++                          netmask_str = "255.255.255.255";
++                        }
++                    }
++                }
++              else
++                {
++                  /* No netmask provided - add single host netmask */
++                  if (strchr (clean_ip, ':'))
++                    {
++                      /* IPv6 - use /128 netmask */
++                      netmask_str = "FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF";
++                    }
++                  else
++                    {
++                      /* IPv4 - use /32 netmask */
++                      netmask_str = "255.255.255.255";
++                    }
++                }
++
++              san =
++                talloc_asprintf (tmp_ctx, "IP:%s/%s", clean_ip, netmask_str);
++
++              if (slash && clean_ip != ip_addr)
++                {
++                  talloc_free (clean_ip);
++                }
++            }
+           else
+             {
+               san = talloc_strdup (tmp_ctx, options->subject_alt_names[i]);
+diff --git a/test/create_ca_test.c b/test/create_ca_test.c
+index 270cfa3dc189540bb807a3d3140ca45335e727b0..eaf2e77052569fd63c09200636004bcd5afcd97c 100644
+--- a/test/create_ca_test.c
++++ b/test/create_ca_test.c
+@@ -21,9 +21,861 @@
+ #include <stdio.h>
+ #include <talloc.h>
+ #include <string.h>
++#include <openssl/x509.h>
++#include <openssl/asn1.h>
+ 
+ #include "include/sscg.h"
+ #include "include/x509.h"
++#include "include/authority.h"
++
++static int
++verify_subject_alt_names (struct sscg_x509_cert *cert)
++{
++  X509 *x509 = cert->certificate;
++  STACK_OF (GENERAL_NAME) *san_names = NULL;
++  GENERAL_NAME *name = NULL;
++  ASN1_STRING *san_str = NULL;
++  int san_count = 0;
++  int found_primary_cn = 0;
++  int found_alt1 = 0;
++  int found_alt2 = 0;
++  int found_ip4_1 = 0;
++  int found_ip4_2 = 0;
++  int found_ip6 = 0;
++  int found_ip4_netmask = 0;
++  int found_ip6_netmask = 0;
++  int found_email = 0;
++  int found_uri = 0;
++  int found_wildcard = 0;
++  int found_subdomain = 0;
++  int found_international = 0;
++  char *name_str = NULL;
++
++  /* Get the Subject Alternative Name extension */
++  san_names = X509_get_ext_d2i (x509, NID_subject_alt_name, NULL, NULL);
++  if (!san_names)
++    {
++      printf ("Certificate missing Subject Alternative Name extension.\n");
++      return EINVAL;
++    }
++
++  san_count = sk_GENERAL_NAME_num (san_names);
++  printf ("\n    Processing %d Subject Alternative Names:\n", san_count);
++
++  /* Check each SAN entry */
++  for (int i = 0; i < san_count; i++)
++    {
++      name = sk_GENERAL_NAME_value (san_names, i);
++
++      switch (name->type)
++        {
++        case GEN_DNS:
++          san_str = name->d.dNSName;
++          name_str = (char *)ASN1_STRING_get0_data (san_str);
++          printf ("      DNS: %s\n", name_str);
++
++          if (strcmp (name_str, "server.example.com") == 0)
++            found_primary_cn = 1;
++          else if (strcmp (name_str, "alt1.example.com") == 0)
++            found_alt1 = 1;
++          else if (strcmp (name_str, "alt2.example.com") == 0)
++            found_alt2 = 1;
++          else if (strcmp (name_str, "*.wildcard.example.com") == 0)
++            found_wildcard = 1;
++          else if (strcmp (name_str, "subdomain.alt1.example.com") == 0)
++            found_subdomain = 1;
++          else if (strcmp (name_str, "xn--nxasmq6b.example.com") == 0)
++            found_international = 1;
++          break;
++
++        case GEN_IPADD:
++          san_str = name->d.iPAddress;
++          /* IP addresses are stored as binary data */
++          if (ASN1_STRING_length (san_str) == 4) /* IPv4 */
++            {
++              const unsigned char *ip_data = ASN1_STRING_get0_data (san_str);
++              printf ("      IP (IPv4): %d.%d.%d.%d\n",
++                      ip_data[0],
++                      ip_data[1],
++                      ip_data[2],
++                      ip_data[3]);
++
++              if (ip_data[0] == 192 && ip_data[1] == 168 && ip_data[2] == 1 &&
++                  ip_data[3] == 100)
++                found_ip4_1 = 1;
++              else if (ip_data[0] == 10 && ip_data[1] == 0 &&
++                       ip_data[2] == 0 && ip_data[3] == 1)
++                found_ip4_2 = 1;
++              else if (ip_data[0] == 203 && ip_data[1] == 0 &&
++                       ip_data[2] == 113 && ip_data[3] == 0)
++                found_ip4_netmask = 1;
++            }
++          else if (ASN1_STRING_length (san_str) == 16) /* IPv6 */
++            {
++              const unsigned char *ip_data = ASN1_STRING_get0_data (san_str);
++              printf ("      IP (IPv6): ");
++              for (int j = 0; j < 16; j += 2)
++                {
++                  printf ("%02x%02x", ip_data[j], ip_data[j + 1]);
++                  if (j < 14)
++                    printf (":");
++                }
++              printf ("\n");
++
++              /* Check for 2001:db8::1 */
++              if (ip_data[0] == 0x20 && ip_data[1] == 0x01 &&
++                  ip_data[2] == 0x0d && ip_data[3] == 0xb8 &&
++                  ip_data[4] == 0x00 && ip_data[5] == 0x00 &&
++                  ip_data[6] == 0x00 && ip_data[7] == 0x00 &&
++                  ip_data[8] == 0x00 && ip_data[9] == 0x00 &&
++                  ip_data[10] == 0x00 && ip_data[11] == 0x00 &&
++                  ip_data[12] == 0x00 && ip_data[13] == 0x00 &&
++                  ip_data[14] == 0x00 && ip_data[15] == 0x01)
++                found_ip6 = 1;
++              /* Check for 2001:db8:85a3:: (netmask stripped) */
++              else if (ip_data[0] == 0x20 && ip_data[1] == 0x01 &&
++                       ip_data[2] == 0x0d && ip_data[3] == 0xb8 &&
++                       ip_data[4] == 0x85 && ip_data[5] == 0xa3 &&
++                       ip_data[6] == 0x00 && ip_data[7] == 0x00 &&
++                       ip_data[8] == 0x00 && ip_data[9] == 0x00 &&
++                       ip_data[10] == 0x00 && ip_data[11] == 0x00 &&
++                       ip_data[12] == 0x00 && ip_data[13] == 0x00 &&
++                       ip_data[14] == 0x00 && ip_data[15] == 0x00)
++                found_ip6_netmask = 1;
++            }
++          break;
++
++        case GEN_EMAIL:
++          san_str = name->d.rfc822Name;
++          name_str = (char *)ASN1_STRING_get0_data (san_str);
++          printf ("      Email: %s\n", name_str);
++
++          if (strcmp (name_str, "admin@example.com") == 0)
++            found_email = 1;
++          break;
++
++        case GEN_URI:
++          san_str = name->d.uniformResourceIdentifier;
++          name_str = (char *)ASN1_STRING_get0_data (san_str);
++          printf ("      URI: %s\n", name_str);
++
++          if (strcmp (name_str, "https://www.example.com/service") == 0)
++            found_uri = 1;
++          break;
++
++        default: printf ("      Other type: %d\n", name->type); break;
++        }
++    }
++
++  GENERAL_NAMES_free (san_names);
++
++  /* Verify all expected SANs were found */
++  int missing_count = 0;
++
++  if (!found_primary_cn)
++    {
++      printf (
++        "    MISSING: Primary CN not found in Subject Alternative Names.\n");
++      missing_count++;
++    }
++
++  if (!found_alt1)
++    {
++      printf (
++        "    MISSING: alt1.example.com not found in Subject Alternative "
++        "Names.\n");
++      missing_count++;
++    }
++
++  if (!found_alt2)
++    {
++      printf (
++        "    MISSING: alt2.example.com not found in Subject Alternative "
++        "Names.\n");
++      missing_count++;
++    }
++
++  if (!found_ip4_1)
++    {
++      printf (
++        "    MISSING: IPv4 192.168.1.100 not found in Subject Alternative "
++        "Names.\n");
++      missing_count++;
++    }
++
++  if (!found_ip4_2)
++    {
++      printf (
++        "    MISSING: IPv4 10.0.0.1 not found in Subject Alternative "
++        "Names.\n");
++      missing_count++;
++    }
++
++  if (!found_ip6)
++    {
++      printf (
++        "    MISSING: IPv6 2001:db8::1 not found in Subject Alternative "
++        "Names.\n");
++      missing_count++;
++    }
++
++  if (!found_ip4_netmask)
++    {
++      printf (
++        "    MISSING: IPv4 203.0.113.0 (from 203.0.113.0/24, netmask "
++        "stripped) not found in Subject Alternative Names.\n");
++      missing_count++;
++    }
++
++  if (!found_ip6_netmask)
++    {
++      printf (
++        "    MISSING: IPv6 2001:db8:85a3:: (from 2001:db8:85a3::/64, netmask "
++        "stripped) not found in Subject Alternative Names.\n");
++      missing_count++;
++    }
++
++  if (!found_email)
++    {
++      printf (
++        "    MISSING: Email admin@example.com not found in Subject "
++        "Alternative Names.\n");
++      missing_count++;
++    }
++
++  if (!found_uri)
++    {
++      printf (
++        "    MISSING: URI https://www.example.com/service not found in "
++        "Subject Alternative Names.\n");
++      missing_count++;
++    }
++
++  if (!found_wildcard)
++    {
++      printf (
++        "    MISSING: Wildcard *.wildcard.example.com not found in Subject "
++        "Alternative Names.\n");
++      missing_count++;
++    }
++
++  if (!found_subdomain)
++    {
++      printf (
++        "    MISSING: Subdomain subdomain.alt1.example.com not found in "
++        "Subject Alternative Names.\n");
++      missing_count++;
++    }
++
++  if (!found_international)
++    {
++      printf (
++        "    MISSING: International domain xn--nxasmq6b.example.com not found "
++        "in Subject Alternative Names.\n");
++      missing_count++;
++    }
++
++  if (missing_count > 0)
++    {
++      printf ("    %d expected SAN entries were missing.\n", missing_count);
++      return EINVAL;
++    }
++
++  printf ("    All expected SAN entries found successfully.\n");
++  return EOK;
++}
++
++static int
++test_san_edge_cases (struct sscg_x509_cert *cert)
++{
++  X509 *x509 = cert->certificate;
++  STACK_OF (GENERAL_NAME) *san_names = NULL;
++  GENERAL_NAME *name = NULL;
++  ASN1_STRING *san_str = NULL;
++  int san_count = 0;
++  int dns_count = 0;
++  int ip_count = 0;
++  int email_count = 0;
++  int uri_count = 0;
++  char *name_str = NULL;
++
++  /* Get the Subject Alternative Name extension */
++  san_names = X509_get_ext_d2i (x509, NID_subject_alt_name, NULL, NULL);
++  if (!san_names)
++    {
++      printf ("Certificate missing Subject Alternative Name extension.\n");
++      return EINVAL;
++    }
++
++  san_count = sk_GENERAL_NAME_num (san_names);
++
++  printf ("\n    Performing comprehensive SAN validation:\n");
++
++  /* Count and validate all SAN types */
++  for (int i = 0; i < san_count; i++)
++    {
++      name = sk_GENERAL_NAME_value (san_names, i);
++
++      switch (name->type)
++        {
++        case GEN_DNS:
++          dns_count++;
++          san_str = name->d.dNSName;
++          name_str = (char *)ASN1_STRING_get0_data (san_str);
++
++          /* Validate DNS name format */
++          if (strlen (name_str) == 0)
++            {
++              printf ("      ERROR: Empty DNS name found in SANs.\n");
++              GENERAL_NAMES_free (san_names);
++              return EINVAL;
++            }
++
++          /* Allow wildcards and validate domain format */
++          if (name_str[0] != '*' && !strchr (name_str, '.'))
++            {
++              printf ("      ERROR: DNS name '%s' missing domain part.\n",
++                      name_str);
++              GENERAL_NAMES_free (san_names);
++              return EINVAL;
++            }
++
++          /* Validate wildcard format */
++          if (name_str[0] == '*' && name_str[1] != '.')
++            {
++              printf ("      ERROR: Invalid wildcard DNS name '%s'.\n",
++                      name_str);
++              GENERAL_NAMES_free (san_names);
++              return EINVAL;
++            }
++          break;
++
++        case GEN_IPADD:
++          ip_count++;
++          san_str = name->d.iPAddress;
++
++          /* Validate IP address length */
++          int ip_len = ASN1_STRING_length (san_str);
++          if (ip_len != 4 && ip_len != 16) /* IPv4 or IPv6 */
++            {
++              printf ("      ERROR: Invalid IP address length: %d bytes.\n",
++                      ip_len);
++              GENERAL_NAMES_free (san_names);
++              return EINVAL;
++            }
++          break;
++
++        case GEN_EMAIL:
++          email_count++;
++          san_str = name->d.rfc822Name;
++          name_str = (char *)ASN1_STRING_get0_data (san_str);
++
++          /* Validate email format */
++          if (!strchr (name_str, '@'))
++            {
++              printf ("      ERROR: Invalid email address '%s' - missing @.\n",
++                      name_str);
++              GENERAL_NAMES_free (san_names);
++              return EINVAL;
++            }
++          break;
++
++        case GEN_URI:
++          uri_count++;
++          san_str = name->d.uniformResourceIdentifier;
++          name_str = (char *)ASN1_STRING_get0_data (san_str);
++
++          /* Validate URI format - must have scheme */
++          if (!strstr (name_str, "://"))
++            {
++              printf ("      ERROR: Invalid URI '%s' - missing scheme.\n",
++                      name_str);
++              GENERAL_NAMES_free (san_names);
++              return EINVAL;
++            }
++          break;
++
++        default:
++          /* Other SAN types are acceptable but not validated here */
++          break;
++        }
++    }
++
++  printf ("      Found %d total SANs: %d DNS, %d IP, %d Email, %d URI.\n",
++          san_count,
++          dns_count,
++          ip_count,
++          email_count,
++          uri_count);
++
++  /* Validate expected counts for comprehensive test */
++  int expected_dns =
++    6; /* CN + alt1 + alt2 + wildcard + subdomain + international */
++  int expected_ip = 5; /* IPv4 x2 + IPv6 x1 + IPv4 netmask + IPv6 netmask */
++  int expected_email = 1;
++  int expected_uri = 1;
++
++  if (dns_count < expected_dns)
++    {
++      printf ("      ERROR: Expected at least %d DNS names, found %d.\n",
++              expected_dns,
++              dns_count);
++      GENERAL_NAMES_free (san_names);
++      return EINVAL;
++    }
++
++  if (ip_count < expected_ip)
++    {
++      printf ("      ERROR: Expected at least %d IP addresses, found %d.\n",
++              expected_ip,
++              ip_count);
++      GENERAL_NAMES_free (san_names);
++      return EINVAL;
++    }
++
++  if (email_count < expected_email)
++    {
++      printf ("      ERROR: Expected at least %d email addresses, found %d.\n",
++              expected_email,
++              email_count);
++      GENERAL_NAMES_free (san_names);
++      return EINVAL;
++    }
++
++  if (uri_count < expected_uri)
++    {
++      printf ("      ERROR: Expected at least %d URIs, found %d.\n",
++              expected_uri,
++              uri_count);
++      GENERAL_NAMES_free (san_names);
++      return EINVAL;
++    }
++
++  printf ("      All SAN format validations passed successfully.\n");
++
++  GENERAL_NAMES_free (san_names);
++  return EOK;
++}
++
++static int
++test_ip_netmask_handling (struct sscg_x509_cert *cert)
++{
++  X509 *x509 = cert->certificate;
++  STACK_OF (GENERAL_NAME) *san_names = NULL;
++  GENERAL_NAME *name = NULL;
++  ASN1_STRING *san_str = NULL;
++  int san_count = 0;
++  int found_netmask_ipv4 = 0;
++  int found_netmask_ipv6 = 0;
++
++  /* Get the Subject Alternative Name extension */
++  san_names = X509_get_ext_d2i (x509, NID_subject_alt_name, NULL, NULL);
++  if (!san_names)
++    {
++      printf ("Certificate missing Subject Alternative Name extension.\n");
++      return EINVAL;
++    }
++
++  san_count = sk_GENERAL_NAME_num (san_names);
++
++  printf ("\n    Testing IP address netmask stripping:\n");
++
++  /* Look specifically for IP addresses that had netmasks stripped */
++  for (int i = 0; i < san_count; i++)
++    {
++      name = sk_GENERAL_NAME_value (san_names, i);
++
++      if (name->type == GEN_IPADD)
++        {
++          san_str = name->d.iPAddress;
++
++          if (ASN1_STRING_length (san_str) == 4) /* IPv4 */
++            {
++              const unsigned char *ip_data = ASN1_STRING_get0_data (san_str);
++
++              /* Check for 203.0.113.0 (from original 203.0.113.0/24) */
++              if (ip_data[0] == 203 && ip_data[1] == 0 && ip_data[2] == 113 &&
++                  ip_data[3] == 0)
++                {
++                  printf (
++                    "      ✓ IPv4 netmask stripped: 203.0.113.0/24 → "
++                    "203.0.113.0\n");
++                  found_netmask_ipv4 = 1;
++                }
++            }
++          else if (ASN1_STRING_length (san_str) == 16) /* IPv6 */
++            {
++              const unsigned char *ip_data = ASN1_STRING_get0_data (san_str);
++
++              /* Check for 2001:db8:85a3:: (from original 2001:db8:85a3::/64) */
++              if (ip_data[0] == 0x20 && ip_data[1] == 0x01 &&
++                  ip_data[2] == 0x0d && ip_data[3] == 0xb8 &&
++                  ip_data[4] == 0x85 && ip_data[5] == 0xa3 &&
++                  ip_data[6] == 0x00 && ip_data[7] == 0x00 &&
++                  ip_data[8] == 0x00 && ip_data[9] == 0x00 &&
++                  ip_data[10] == 0x00 && ip_data[11] == 0x00 &&
++                  ip_data[12] == 0x00 && ip_data[13] == 0x00 &&
++                  ip_data[14] == 0x00 && ip_data[15] == 0x00)
++                {
++                  printf (
++                    "      ✓ IPv6 netmask stripped: 2001:db8:85a3::/64 → "
++                    "2001:db8:85a3::\n");
++                  found_netmask_ipv6 = 1;
++                }
++            }
++        }
++    }
++
++  GENERAL_NAMES_free (san_names);
++
++  /* Verify that netmask stripping worked correctly */
++  if (!found_netmask_ipv4)
++    {
++      printf ("      ERROR: IPv4 netmask stripping test failed.\n");
++      return EINVAL;
++    }
++
++  if (!found_netmask_ipv6)
++    {
++      printf ("      ERROR: IPv6 netmask stripping test failed.\n");
++      return EINVAL;
++    }
++
++  printf ("      All IP address netmask tests passed successfully.\n");
++  return EOK;
++}
++
++static int
++verify_name_constraints (struct sscg_x509_cert *ca_cert,
++                         char **expected_san_list)
++{
++  X509 *x509 = ca_cert->certificate;
++  X509_EXTENSION *name_constraints_ext = NULL;
++  ASN1_OCTET_STRING *ext_data = NULL;
++  BIO *bio = NULL;
++  char *ext_str = NULL;
++  char *line = NULL;
++  char *saveptr = NULL;
++  size_t ext_str_len = 0;
++  int found_constraints[20] = {
++    0
++  }; /* Track which expected constraints we found */
++  int missing_count = 0;
++  int j;
++
++  printf ("\n    Verifying name constraints in CA certificate:\n");
++
++  /* Find the name constraints extension */
++  int ext_idx = X509_get_ext_by_NID (x509, NID_name_constraints, -1);
++  if (ext_idx < 0)
++    {
++      printf (
++        "      ERROR: CA certificate missing Name Constraints extension.\n");
++      return EINVAL;
++    }
++
++  name_constraints_ext = X509_get_ext (x509, ext_idx);
++  if (!name_constraints_ext)
++    {
++      printf ("      ERROR: Failed to get Name Constraints extension.\n");
++      return EINVAL;
++    }
++
++  /* Get the extension data */
++  ext_data = X509_EXTENSION_get_data (name_constraints_ext);
++  if (!ext_data)
++    {
++      printf ("      ERROR: Failed to get Name Constraints extension data.\n");
++      return EINVAL;
++    }
++
++  /* Convert the extension to a readable string using BIO */
++  bio = BIO_new (BIO_s_mem ());
++  if (!bio)
++    {
++      printf ("      ERROR: Failed to create BIO for extension parsing.\n");
++      return EINVAL;
++    }
++
++  /* Print the extension to the BIO */
++  if (!X509V3_EXT_print (bio, name_constraints_ext, 0, 0))
++    {
++      printf ("      ERROR: Failed to print Name Constraints extension.\n");
++      BIO_free (bio);
++      return EINVAL;
++    }
++
++  /* Get the string representation */
++  ext_str_len = BIO_get_mem_data (bio, &ext_str);
++  if (ext_str_len <= 0 || !ext_str)
++    {
++      printf ("      ERROR: Failed to get extension string data.\n");
++      BIO_free (bio);
++      return EINVAL;
++    }
++
++  /* Null-terminate the string for parsing */
++  char *ext_str_copy = malloc (ext_str_len + 1);
++  if (!ext_str_copy)
++    {
++      printf (
++        "      ERROR: Failed to allocate memory for extension parsing.\n");
++      BIO_free (bio);
++      return ENOMEM;
++    }
++  memcpy (ext_str_copy, ext_str, ext_str_len);
++  ext_str_copy[ext_str_len] = '\0';
++
++  printf ("      Name Constraints content:\n%s\n", ext_str_copy);
++
++  /* Parse the extension string to find constraints */
++  line = strtok_r (ext_str_copy, "\n", &saveptr);
++  while (line)
++    {
++      /* Look for "Permitted:" sections and DNS/IP entries */
++      if (strstr (line, "DNS:"))
++        {
++          char *dns_start = strstr (line, "DNS:");
++          if (dns_start)
++            {
++              dns_start += 4; /* Skip "DNS:" */
++              /* Trim whitespace */
++              while (*dns_start == ' ' || *dns_start == '\t')
++                dns_start++;
++
++              printf ("        Found DNS constraint: %s\n", dns_start);
++
++              /* Check if this matches our expected CN (truncated) */
++              if (strstr (dns_start, "server"))
++                {
++                  found_constraints[0] = 1;
++                }
++
++              /* Check against our expected SAN list */
++              if (expected_san_list)
++                {
++                  for (j = 0; expected_san_list[j]; j++)
++                    {
++                      char *expected_dns = NULL;
++
++                      if (!strchr (expected_san_list[j], ':'))
++                        {
++                          expected_dns = expected_san_list[j];
++                        }
++                      else if (strncmp (expected_san_list[j], "DNS:", 4) == 0)
++                        {
++                          expected_dns = expected_san_list[j] + 4;
++                        }
++
++                      if (expected_dns && strstr (dns_start, expected_dns))
++                        {
++                          found_constraints[j + 1] = 1;
++                        }
++                    }
++                }
++            }
++        }
++      else if (strstr (line, "IP:"))
++        {
++          char *ip_start = strstr (line, "IP:");
++          if (ip_start)
++            {
++              ip_start += 3; /* Skip "IP:" */
++              while (*ip_start == ' ' || *ip_start == '\t')
++                ip_start++;
++
++              printf ("        Found IP constraint: %s\n", ip_start);
++
++              /* Check against expected IP SANs */
++              if (expected_san_list)
++                {
++                  for (j = 0; expected_san_list[j]; j++)
++                    {
++                      if (strncmp (expected_san_list[j], "IP:", 3) == 0)
++                        {
++                          char *expected_ip = expected_san_list[j] + 3;
++                          char *slash = strchr (expected_ip, '/');
++                          char expected_constraint[128];
++                          char clean_ip[64];
++
++                          /* Extract IP and netmask parts */
++                          if (slash)
++                            {
++                              int ip_len = slash - expected_ip;
++                              strncpy (clean_ip, expected_ip, ip_len);
++                              clean_ip[ip_len] = '\0';
++
++                              /* Parse the CIDR netmask */
++                              char *cidr_str = slash + 1;
++                              int cidr_bits = atoi (cidr_str);
++
++                              /* Convert to constraint format with proper netmask */
++                              if (strchr (clean_ip, ':'))
++                                {
++                                  /* IPv6 - convert CIDR to hex netmask */
++                                  const char *netmask;
++                                  if (cidr_bits == 128)
++                                    netmask =
++                                      "FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:"
++                                      "FFFF";
++                                  else if (cidr_bits == 64)
++                                    netmask = "FFFF:FFFF:FFFF:FFFF:0:0:0:0";
++                                  else
++                                    netmask =
++                                      "FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:"
++                                      "FFFF"; /* default to /128 */
++
++                                  /* Handle compressed IPv6 forms */
++                                  if (strstr (clean_ip, "2001:db8::1"))
++                                    {
++                                      snprintf (expected_constraint,
++                                                sizeof (expected_constraint),
++                                                "IP:2001:DB8:0:0:0:0:0:1/%s",
++                                                netmask);
++                                    }
++                                  else if (strstr (clean_ip,
++                                                   "2001:db8:85a3::"))
++                                    {
++                                      snprintf (
++                                        expected_constraint,
++                                        sizeof (expected_constraint),
++                                        "IP:2001:DB8:85A3:0:0:0:0:0/%s",
++                                        netmask);
++                                    }
++                                  else
++                                    {
++                                      snprintf (expected_constraint,
++                                                sizeof (expected_constraint),
++                                                "IP:%s/%s",
++                                                clean_ip,
++                                                netmask);
++                                    }
++                                }
++                              else
++                                {
++                                  /* IPv4 - convert CIDR to dotted decimal */
++                                  const char *netmask;
++                                  if (cidr_bits == 32)
++                                    netmask = "255.255.255.255";
++                                  else if (cidr_bits == 24)
++                                    netmask = "255.255.255.0";
++                                  else if (cidr_bits == 16)
++                                    netmask = "255.255.0.0";
++                                  else if (cidr_bits == 8)
++                                    netmask = "255.0.0.0";
++                                  else
++                                    netmask =
++                                      "255.255.255.255"; /* default to /32 */
++
++                                  snprintf (expected_constraint,
++                                            sizeof (expected_constraint),
++                                            "IP:%s/%s",
++                                            clean_ip,
++                                            netmask);
++                                }
++                            }
++                          else
++                            {
++                              /* No netmask - add single host netmask */
++                              strcpy (clean_ip, expected_ip);
++
++                              if (strchr (clean_ip, ':'))
++                                {
++                                  /* IPv6 with /128 netmask */
++                                  if (strstr (clean_ip, "2001:db8::1"))
++                                    {
++                                      snprintf (expected_constraint,
++                                                sizeof (expected_constraint),
++                                                "IP:2001:DB8:0:0:0:0:0:1/"
++                                                "FFFF:FFFF:FFFF:FFFF:FFFF:"
++                                                "FFFF:FFFF:FFFF");
++                                    }
++                                  else if (strstr (clean_ip,
++                                                   "2001:db8:85a3::"))
++                                    {
++                                      snprintf (expected_constraint,
++                                                sizeof (expected_constraint),
++                                                "IP:2001:DB8:85A3:0:0:0:0:0/"
++                                                "FFFF:FFFF:FFFF:FFFF:FFFF:"
++                                                "FFFF:FFFF:FFFF");
++                                    }
++                                  else
++                                    {
++                                      snprintf (expected_constraint,
++                                                sizeof (expected_constraint),
++                                                "IP:%s/"
++                                                "FFFF:FFFF:FFFF:FFFF:FFFF:"
++                                                "FFFF:FFFF:FFFF",
++                                                clean_ip);
++                                    }
++                                }
++                              else
++                                {
++                                  /* IPv4 with /32 netmask */
++                                  snprintf (expected_constraint,
++                                            sizeof (expected_constraint),
++                                            "IP:%s/255.255.255.255",
++                                            clean_ip);
++                                }
++                            }
++
++                          /* Check if this expected constraint matches what we found */
++                          /* Skip the "IP:" prefix for comparison since ip_start doesn't include it */
++                          char *constraint_without_prefix =
++                            expected_constraint + 3; /* Skip "IP:" */
++                          if (strcmp (ip_start, constraint_without_prefix) ==
++                              0)
++                            {
++                              found_constraints[j + 1] = 1;
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
++      line = strtok_r (NULL, "\n", &saveptr);
++    }
++
++  free (ext_str_copy);
++  BIO_free (bio);
++
++  /* Verify that we found all expected constraints */
++  if (!found_constraints[0])
++    {
++      printf ("      MISSING: CN constraint 'server' not found.\n");
++      missing_count++;
++    }
++
++  if (expected_san_list)
++    {
++      for (j = 0; expected_san_list[j]; j++)
++        {
++          if (!found_constraints[j + 1])
++            {
++              /* Only report missing DNS and IP constraints, skip email/URI */
++              if (!strchr (expected_san_list[j], ':') ||
++                  strncmp (expected_san_list[j], "DNS:", 4) == 0 ||
++                  strncmp (expected_san_list[j], "IP:", 3) == 0)
++                {
++                  printf ("      MISSING: Constraint for '%s' not found.\n",
++                          expected_san_list[j]);
++                  missing_count++;
++                }
++            }
++        }
++    }
++
++  if (missing_count > 0)
++    {
++      printf ("      %d expected name constraints were missing.\n",
++              missing_count);
++      return EINVAL;
++    }
++
++  printf ("      All expected name constraints found successfully.\n");
++  return EOK;
++}
+ 
+ int
+ main (int argc, char **argv)
+@@ -35,6 +887,11 @@ main (int argc, char **argv)
+   struct sscg_evp_pkey *pkey = NULL;
+   struct sscg_x509_cert *cert = NULL;
+ 
++  /* Variables for CA testing */
++  struct sscg_x509_cert *ca_cert = NULL;
++  struct sscg_evp_pkey *ca_key = NULL;
++  struct sscg_options ca_options;
++
+   TALLOC_CTX *tmp_ctx = talloc_new (NULL);
+   if (!tmp_ctx)
+     {
+@@ -98,7 +955,108 @@ main (int argc, char **argv)
+     tmp_ctx, csr, serial, 3650, NULL, pkey, EVP_sha512 (), &cert);
+   CHECK_OK (ret);
+ 
+-  ret = EOK;
++  /* ============= SERVICE CERTIFICATE TESTS ============= */
++
++  /* Verify that subject alternative names were properly included */
++  printf ("Verifying subject alternative names in service certificate. ");
++  int verify_ret = verify_subject_alt_names (cert);
++  if (verify_ret != EOK)
++    {
++      printf ("FAILED.\n");
++      ret = verify_ret; /* Store first failure but continue testing */
++    }
++  else
++    {
++      printf ("SUCCESS.\n");
++    }
++
++  /* Test additional SAN verification scenarios */
++  printf ("Testing SAN edge cases and validation. ");
++  int edge_ret = test_san_edge_cases (cert);
++  if (edge_ret != EOK)
++    {
++      printf ("FAILED.\n");
++      if (ret == EOK)
++        ret = edge_ret; /* Store first failure */
++    }
++  else
++    {
++      printf ("SUCCESS.\n");
++    }
++
++  /* Test IP address netmask handling */
++  printf ("Testing IP address netmask stripping functionality. ");
++  int netmask_ret = test_ip_netmask_handling (cert);
++  if (netmask_ret != EOK)
++    {
++      printf ("FAILED.\n");
++      if (ret == EOK)
++        ret = netmask_ret; /* Store first failure */
++    }
++  else
++    {
++      printf ("SUCCESS.\n");
++    }
++
++  /* ============= CA CERTIFICATE TESTS ============= */
++
++  printf ("\n=== CA CERTIFICATE TESTS ===\n");
++
++  /* Set up options for CA creation */
++  memset (&ca_options, 0, sizeof (ca_options));
++  ca_options.country = "US";
++  ca_options.state = "";
++  ca_options.locality = "";
++  ca_options.org = "Unspecified";
++  ca_options.email = "";
++  ca_options.hostname = "server.example.com";
++  ca_options.hash_fn = EVP_sha256 ();
++  ca_options.lifetime = 3650;
++  ca_options.verbosity = SSCG_QUIET;
++
++  /* Set up the same subject alternative names for the CA */
++  ca_options.subject_alt_names = certinfo->subject_alt_names;
++
++  /* Create the private CA */
++  printf ("Creating private CA certificate. ");
++  ret = create_private_CA (tmp_ctx, &ca_options, &ca_cert, &ca_key);
++  if (ret != EOK)
++    {
++      printf ("FAILED.\n");
++      goto done;
++    }
++  else
++    {
++      printf ("SUCCESS.\n");
++    }
++
++  /* Verify name constraints in the CA certificate */
++  printf ("Verifying name constraints in CA certificate. ");
++  int ca_constraints_ret =
++    verify_name_constraints (ca_cert, certinfo->subject_alt_names);
++  if (ca_constraints_ret != EOK)
++    {
++      printf ("FAILED.\n");
++      if (ret == EOK)
++        ret = ca_constraints_ret;
++    }
++  else
++    {
++      printf ("SUCCESS.\n");
++    }
++
++  /* Summary of all test results */
++  printf ("\n=== TEST SUMMARY ===\n");
++  printf ("Service cert SAN verification: %s\n",
++          verify_ret == EOK ? "PASS" : "FAIL");
++  printf ("Service cert edge case validation: %s\n",
++          edge_ret == EOK ? "PASS" : "FAIL");
++  printf ("Service cert netmask handling: %s\n",
++          netmask_ret == EOK ? "PASS" : "FAIL");
++  printf ("CA certificate creation: %s\n", ca_cert ? "PASS" : "FAIL");
++  printf ("CA name constraints verification: %s\n",
++          ca_constraints_ret == EOK ? "PASS" : "FAIL");
++
+ done:
+   if (ret != EOK)
+     {
+-- 
+2.50.1
+

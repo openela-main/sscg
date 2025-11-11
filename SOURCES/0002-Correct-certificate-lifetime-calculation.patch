@@ -1,7 +1,7 @@
-From 87604820a935f87a8f533e3f294419d27c0514eb Mon Sep 17 00:00:00 2001
+From 5852d74f338bb6de3f303275aa73024f082b47bf Mon Sep 17 00:00:00 2001
 From: Allison Karlitskaya <allison.karlitskaya@redhat.com>
 Date: Tue, 26 Oct 2021 12:32:13 +0200
-Subject: [PATCH 2/2] Correct certificate lifetime calculation
+Subject: [PATCH 2/6] Correct certificate lifetime calculation
 
 sscg allows passing the certificate lifetime, as a number of days, as a
 commandline argument.  It converts this value to seconds using the
@@ -28,9 +28,7 @@ diff --git a/src/x509.c b/src/x509.c
 index dc1594a4bdcb9d81607f0fe5ad2d4562e5edb533..7c7e4dfe56d5756862f3e0f851941e846ce96f31 100644
 --- a/src/x509.c
 +++ b/src/x509.c
-@@ -416,11 +416,11 @@ sscg_sign_x509_csr (TALLOC_CTX *mem_ctx,
-       X509_set_issuer_name (cert, X509_REQ_get_subject_name (csr));
-     }
+@@ -418,7 +418,7 @@ sscg_sign_x509_csr (TALLOC_CTX *mem_ctx,
  
    /* set time */
    X509_gmtime_adj (X509_get_notBefore (cert), 0);
@@ -39,8 +37,6 @@ index dc1594a4bdcb9d81607f0fe5ad2d4562e5edb533..7c7e4dfe56d5756862f3e0f851941e84
  
    /* set subject */
    subject = X509_NAME_dup (X509_REQ_get_subject_name (csr));
-   sslret = X509_set_subject_name (cert, subject);
-   CHECK_SSL (sslret, X509_set_subject_name);
 -- 
-2.33.0
+2.49.0
 

@@ -1,7 +1,7 @@
-From d2277e711bb16e3b98f43565e71b7865b5fed423 Mon Sep 17 00:00:00 2001
+From 67ef8f036f7324fe37bc7a7e31a38e7088d21df2 Mon Sep 17 00:00:00 2001
 From: Stephen Gallagher <sgallagh@redhat.com>
 Date: Sat, 7 Aug 2021 11:48:04 -0400
-Subject: [PATCH 1/2] Drop usage of ERR_GET_FUNC()
+Subject: [PATCH 1/6] Drop usage of ERR_GET_FUNC()
 
 This macro was dropped in OpenSSL 3.0 and has actually not been
 providing a valid return code for some time.
@@ -17,9 +17,7 @@ diff --git a/include/sscg.h b/include/sscg.h
 index faf86ba4f68e186bd35c7bc3ec77b98b8e37d253..851dc93175607e5223a70ef40a5feb24b7b69215 100644
 --- a/include/sscg.h
 +++ b/include/sscg.h
-@@ -94,11 +94,10 @@
-       if (_sslret != 1)                                                       \
-         {                                                                     \
+@@ -96,7 +96,6 @@
            /* Get information about error from OpenSSL */                      \
            unsigned long _ssl_error = ERR_get_error ();                        \
            if ((ERR_GET_LIB (_ssl_error) == ERR_LIB_UI) &&                     \
@@ -27,8 +25,6 @@ index faf86ba4f68e186bd35c7bc3ec77b98b8e37d253..851dc93175607e5223a70ef40a5feb24
                ((ERR_GET_REASON (_ssl_error) == UI_R_RESULT_TOO_LARGE) ||      \
                 (ERR_GET_REASON (_ssl_error) == UI_R_RESULT_TOO_SMALL)))       \
              {                                                                 \
-               fprintf (                                                       \
-                 stderr,                                                       \
 -- 
-2.33.0
+2.49.0
 

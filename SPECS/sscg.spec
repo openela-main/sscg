@@ -9,7 +9,7 @@
 
 Name:           sscg
 Version:        3.0.0
-Release:        7%{?dist}
+Release:        10%{?dist}
 Summary:        Simple SSL certificate generator
 
 License:        GPLv3+ with exceptions
@@ -31,6 +31,9 @@ Patch: 0002-Correct-certificate-lifetime-calculation.patch
 Patch: 0003-Truncate-IP-address-in-SAN.patch
 Patch: 0004-dhparams-don-t-fail-if-default-file-can-t-be-created.patch
 Patch: 0005-dhparams-Fix-the-FIPS_mode-call-for-OpenSSL-3.0.patch
+Patch: 0006-x509-Use-proper-version-for-CSR.patch
+Patch: 0007-Ensure-critical-basicConstraint-for-CA-cert.patch
+Patch: 0008-Fix-IP-address-handling-in-CA-certificate-SAN-constr.patch
 
 %description
 A utility to aid in the creation of more secure "self-signed"
@@ -61,7 +64,19 @@ false signatures from the service certificate.
 %{_mandir}/man8/%{name}.8*
 
 %changelog
-* Fri Dec 02 2022 Stephen Gallagher <sgallagh@redhat.com> - 3.0.0-6
+* Mon Aug 11 2025 Stephen Gallagher <sgallagh@redhat.com> - 3.0.0-10
+- Fix IP address handling in CA certificate SAN constraints
+- Resolves: RHEL-107289
+
+* Tue Apr 22 2025 Stephen Gallagher <sgallagh@redhat.com> - 3.0.0-9
+- Ensure 'critical' basicConstraint for CA cert
+- Resolves: RHEL-88119
+
+* Wed Apr 02 2025 Stephen Gallagher <sgallagh@redhat.com> - 3.0.0-8
+- x509: Use proper version for CSR
+- Resolves: RHEL-85851
+
+* Fri Dec 02 2022 Stephen Gallagher <sgallagh@redhat.com> - 3.0.0-7
 - Use EVP_default_properties_is_fips_enabled() on OpenSSL 3.0
 - Related: rhbz#2083879
 
