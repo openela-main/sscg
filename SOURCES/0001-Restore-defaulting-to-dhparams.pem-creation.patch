@@ -1,0 +1,119 @@
+From 771a7663bccbd360f017c4c22358a46abcdfa93f Mon Sep 17 00:00:00 2001
+From: Stephen Gallagher <sgallagh@redhat.com>
+Date: Mon, 27 Oct 2025 14:58:11 -0400
+Subject: [PATCH] Restore defaulting to dhparams.pem creation
+
+This was disabled upstream, but for backwards-compatibility in the RHEL
+9 and RHEL 10 lifecycle, we'll continue to do so there.
+
+This reverts commit 0e5e011acc2dc19f3c2fcb5699cf8fa662a2b135.
+
+Signed-off-by: Stephen Gallagher <sgallagh@redhat.com>
+---
+ src/arguments.c                |  4 ++--
+ src/sscg.c                     | 39 +++++++++++++++++++++++++---------
+ test/test_dhparams_creation.sh |  6 +-----
+ 3 files changed, 32 insertions(+), 17 deletions(-)
+
+diff --git a/src/arguments.c b/src/arguments.c
+index 38c8740c1f159368d6fc92d51ba48d83700c3320..4ff75fdf86728592e7ca05db4cf4ac88bf79ca2e 100644
+--- a/src/arguments.c
++++ b/src/arguments.c
+@@ -682,7 +682,7 @@ sscg_handle_arguments (TALLOC_CTX *mem_ctx,
+       &options->dhparams_file,
+       0,
+       _("A file to contain a set of Diffie-Hellman parameters. "
+-        "(Default: not created)"),
++        "(Default: \"./dhparams.pem\")"),
+       NULL
+     },
+ 
+@@ -692,7 +692,7 @@ sscg_handle_arguments (TALLOC_CTX *mem_ctx,
+       POPT_ARG_NONE | POPT_ARGFLAG_DOC_HIDDEN,
+       &options->skip_dhparams,
+       0,
+-      _ ("Deprecated: Retained for backwards compatibility. To be removed in SSCG 5.0."),
++      _ ("Do not create the dhparams file"),
+       NULL
+     },
+ 
+diff --git a/src/sscg.c b/src/sscg.c
+index b9b191f109300f6447262858f57a3a8321a14966..d2dce334cff1342d975e9867a2c82a222d76925e 100644
+--- a/src/sscg.c
++++ b/src/sscg.c
+@@ -166,19 +166,38 @@ main (int argc, const char **argv)
+                                        options->crl_mode);
+   CHECK_OK (ret);
+ 
+-  if (options->dhparams_file)
++  if (!options->skip_dhparams)
+     {
+-      dhparams_file = talloc_strdup (main_ctx, options->dhparams_file);
+-      CHECK_MEM (dhparams_file);
++      if (options->dhparams_file)
++        {
++          dhparams_file = talloc_strdup (main_ctx, options->dhparams_file);
++          CHECK_MEM (dhparams_file);
+ 
+-      ret = sscg_io_utils_add_output_file (options->streams,
+-                                           SSCG_FILE_TYPE_DHPARAMS,
+-                                           dhparams_file,
+-                                           options->overwrite,
+-                                           options->dhparams_mode);
+-      CHECK_OK (ret);
++          ret = sscg_io_utils_add_output_file (options->streams,
++                                               SSCG_FILE_TYPE_DHPARAMS,
++                                               dhparams_file,
++                                               options->overwrite,
++                                               options->dhparams_mode);
++          CHECK_OK (ret);
++        }
++      else
++        {
++          dhparams_file = talloc_strdup (main_ctx, "./dhparams.pem");
++          CHECK_MEM (dhparams_file);
++
++          ret = sscg_io_utils_add_output_file (options->streams,
++                                               SSCG_FILE_TYPE_DHPARAMS,
++                                               dhparams_file,
++                                               options->overwrite,
++                                               options->dhparams_mode);
++          SSCG_LOG (SSCG_VERBOSE,
++                    "Could not open dhparams file %s: %s\n",
++                    dhparams_file,
++                    strerror (ret));
++          /* This is non-fatal if the file path was not explicitly passed */
++          ret = EOK;
++        }
+     }
+-
+   /* Validate and open the file paths */
+   ret = sscg_io_utils_open_BIOs (options->streams);
+   CHECK_OK (ret);
+diff --git a/test/test_dhparams_creation.sh b/test/test_dhparams_creation.sh
+index d0b4cbb71f3cd1656f1422524c4da7b30fbf3e0a..49f2b08d23246c90663eb7d2e5078817eb42139b 100755
+--- a/test/test_dhparams_creation.sh
++++ b/test/test_dhparams_creation.sh
+@@ -42,10 +42,6 @@
+ # just warn and ignore it if it was not (returning 0). However, if it is
+ # explicitly requested on the command-line and cannot be written to that
+ # location, it should fail with an error code.
+-#
+-# Updated 2025-10-21: SSCG 4.0 no longer creates the dhparams file by default.
+-# It should not attempt to create it unless explicitly requested using the
+-# --dhparams-file option.
+ 
+ set -e
+ 
+@@ -181,7 +177,7 @@ run_test \
+     "" \
+     0 \
+     "$WRITABLE_DIR/dhparams.pem" \
+-    "false" \
++    "true" \
+     "$WRITABLE_DIR"
+ 
+ # Test 2: No --dhparams-file, readonly directory, no existing file
+-- 
+2.52.0
+
